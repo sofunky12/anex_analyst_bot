@@ -29,6 +29,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
+from aiogram.utils.formatting import Text, TextMention
 
 import crypto
 import db
@@ -180,13 +181,18 @@ async def cmd_activate(message: Message, bot: Bot) -> None:
     sent = await _send_dashboard_token_message(
         bot, message.from_user.id, message.chat.id, message.chat.title, token, reissued=False,
     )
+    dashboard_for_others = "Остальным участникам чата — личный дашборд, в личке с ботом:\n/dashboard"
     if sent:
-        await message.reply("📊 Запущен сбор статистики чата. Ссылка на дашборд отправлена вам в личку.")
+        await message.reply(
+            "📊 Запущен сбор статистики чата. Ссылка на дашборд отправлена вам в личку.\n\n"
+            + dashboard_for_others
+        )
     else:
         await message.reply(
             "📊 Запущен сбор статистики чата.\n\n"
             "⚠️ Не получилось отправить ссылку на дашборд в личку — сначала "
-            "напиши мне (боту) любое сообщение в личных сообщениях, затем повтори:\n/activate"
+            "напиши мне (боту) любое сообщение в личных сообщениях, затем повтори:\n/activate\n\n"
+            + dashboard_for_others
         )
 
 
@@ -474,6 +480,40 @@ async def on_my_chat_member(event: ChatMemberUpdated) -> None:
                 conn, chat_id=event.chat.id,
                 deactivated_at=datetime.now(timezone.utc).isoformat(),
             )
+
+
+_DASHBOARD_HINT = "Личный дашборд — в личке с ботом:\n/dashboard"
+
+
+def _mention_label(user) -> str:
+    # Тег @username виднее и сразу даёт понять, что добавили именно тебя —
+    # приоритет над именем. Без публичного username (не у всех есть) —
+    # имя как подпись, TextMention всё равно пингует по user_id.
+    return f"@{user.username}" if user.username else (user.full_name or str(user.id))
+
+
+@router.message(F.new_chat_members, F.chat.type.in_(GROUP_TYPES))
+async def on_new_chat_members(message: Message, bot: Bot) -> None:
+    # AAB-15: новый участник уже активированного чата иначе никак не узнаёт
+    # про /dashboard — бот проактивно написать ему в личку не может (Telegram
+    # не разрешает первым), поэтому предупреждаем прямо в группе.
+    joined = [u for u in message.new_chat_members if u.id != bot.id]
+    if not joined:
+        return  # добавили самого бота — это флоу /activate через on_my_chat_member
+    with db.get_conn() as conn:
+        if not db.is_chat_active(conn, message.chat.id):
+            return
+    mentions: list = []
+    for i, user in enumerate(joined):
+        if i:
+            mentions.append(", ")
+        mentions.append(TextMention(_mention_label(user), user=user))
+    content = Text(
+        "👋 Добро пожаловать, ", *mentions, "!\n\n",
+        "В этом чате идёт сбор статистики, подробности:\n/status\n\n",
+        _DASHBOARD_HINT,
+    )
+    await message.answer(**content.as_kwargs())
 
 
 @router.message(F.chat.type.in_(GROUP_TYPES))
