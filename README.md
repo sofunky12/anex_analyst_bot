@@ -169,7 +169,7 @@ streamlit run src/dashboard.py
 `[processes]`/машины — volume на Fly физически привязывается только к одной
 машине, так что общий диск возможен только внутри одной. Подробности и
 история решения — в `CLAUDE.md`, раздел «Хостинг — Fly.io», и
-`docs/tasks/ANEX-003.md`.
+`docs/tasks/AAB-3.md`.
 
 Живой пример: [anex-analyst-bot.fly.dev](https://anex-analyst-bot.fly.dev),
 приложение `anex-analyst-bot` (дефис — Fly не принимает подчёркивание в имени
