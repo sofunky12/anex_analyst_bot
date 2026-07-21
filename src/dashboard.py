@@ -5,6 +5,7 @@
 Запуск: streamlit run dashboard.py
 """
 
+import hmac
 import os
 from datetime import date, timedelta
 
@@ -132,6 +133,58 @@ def trend_chart(trend: dict):
     ).properties(height=240)
 
 
+# ---------- Авторизация (AAB-10) ----------
+# Без персональной ссылки чата (?token=) и без мастер-пароля дашборд не
+# показывает вообще ничего, включая метаданные (см. AAB-8 — до этой задачи
+# дашборд был публично доступен без пароля). Два независимых входа: ссылка на
+# конкретный чат (для админа этого чата) и мастер-пароль владельца (видит все
+# чаты со селектором). При совпадении обоих сразу — мастер-режим приоритетнее.
+
+MASTER_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
+
+
+def _try_chat_token_auth():
+    # Проверка отсутствия файла БД — здесь, а не после логина: sqlite3.connect
+    # молча создаёт пустой файл при первом обращении, а неавторизованные
+    # запросы с произвольными токенами не должны иметь такой побочный эффект.
+    if not db.DB_PATH.exists():
+        return None
+    # URL несёт только ?token= (без chat_id/user_id — по итогам живого теста
+    # решили не светить лишние идентификаторы в адресной строке/логах). Чат
+    # находится обратным поиском по самому токену, см.
+    # db.get_chat_id_by_dashboard_token (AAB-12: токен теперь на пару
+    # чат+пользователь, но самому дашборду это не важно — фильтрация вкладок
+    # всё так же строго по chat_id).
+    token = st.query_params.get("token")
+    if not token:
+        return None
+    with db.get_conn() as conn:
+        return db.get_chat_id_by_dashboard_token(conn, token)
+
+
+def _master_login_widget() -> None:
+    if not MASTER_PASSWORD:
+        return
+    with st.expander("Мастер-доступ"):
+        pwd = st.text_input("Мастер-пароль", type="password", key="master_pwd_input")
+        if st.button("Войти", key="master_pwd_submit") and pwd:
+            if hmac.compare_digest(pwd, MASTER_PASSWORD):
+                st.session_state["dashboard_master_authed"] = True
+                st.rerun()
+            else:
+                st.error("Неверный пароль.")
+
+
+master_authed = st.session_state.get("dashboard_master_authed", False)
+single_chat_id = None if master_authed else _try_chat_token_auth()
+
+if not master_authed and single_chat_id is None:
+    st.title("📊 Активность чата")
+    st.error("Нет доступа.")
+    _master_login_widget()
+    st.stop()
+
+
 # ---------- Страница ----------
 
 st.title("📊 Активность чата")
@@ -140,21 +193,27 @@ if not db.DB_PATH.exists():
     st.warning("База данных не найдена. Запусти `bot.py` и активируй чат командой `/activate`.")
     st.stop()
 
-chats = load_chats()
-if not chats:
-    st.warning("В базе пока нет сообщений. Дай боту немного поработать после `/activate`.")
-    st.stop()
-
 with st.sidebar:
     st.header("Фильтры")
 
-    if len(chats) == 1:
-        chat_id, chat_title = chats[0]
-        st.caption(f"Чат: {chat_title or chat_id}")
+    if master_authed:
+        chats = load_chats()
+        if not chats:
+            st.warning("В базе пока нет сообщений. Дай боту немного поработать после `/activate`.")
+            st.stop()
+        if len(chats) == 1:
+            chat_id, chat_title = chats[0]
+            st.caption(f"Чат: {chat_title or chat_id}")
+        else:
+            labels = {(title or f"Чат {cid}"): cid for cid, title in chats}
+            selected_label = st.selectbox("Чат", list(labels.keys()))
+            chat_id = labels[selected_label]
     else:
-        labels = {(title or f"Чат {cid}"): cid for cid, title in chats}
-        selected_label = st.selectbox("Чат", list(labels.keys()))
-        chat_id = labels[selected_label]
+        chat_id = single_chat_id
+        with db.get_conn() as conn:
+            chat_title = db.chat_title(conn, chat_id)
+        st.caption(f"Чат: {chat_title or chat_id}")
+        _master_login_widget()
 
     min_date_str, max_date_str = load_date_bounds(chat_id)
     if min_date_str:
