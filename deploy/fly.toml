@@ -1,0 +1,57 @@
+# Фаза 2 — хостинг на Fly.io (скорректировано после первого живого деплоя).
+# Один app, ОДНА Fly Machine на оба процесса (bot, dashboard), запускаются
+# через start.sh внутри одного контейнера — так у них физически один и тот же
+# persistent volume. Два отдельных [processes] не работают: Fly создаёт под
+# каждый process group отдельную машину и отдельный volume — см. CLAUDE.md,
+# костыль «Volume на Fly.io физически привязан к одной машине», и
+# docs/tasks/ANEX-003.md.
+
+app = "anex-analyst-bot"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DATA_DIR = "/data"
+
+[[mounts]]
+  source = "data"
+  destination = "/data"
+
+# По умолчанию Fly не перезапускает машину, если она сама вышла с кодом 0 —
+# это трактуется как «намеренная остановка», а не сбой (найдено на живом
+# тесте fail-fast, фаза 2: SIGTERM одному из процессов внутри start.sh
+# приводит к чистому exit 0 всего контейнера, и без этой секции машина
+# остаётся лежать, пока её кто-то не разбудит запросом к dashboard или
+# вручную). `policy = "always"` — Fly поднимает машину заново при любом
+# завершении, вне зависимости от кода выхода: bot не должен оставаться
+# мёртвым неопределённо долго.
+[[restart]]
+  policy = "always"
+
+# bot использует long polling и не должен засыпать никогда — значит вся
+# машина (а не только dashboard) держится постоянно включённой. Экономия на
+# автостопе dashboard, которая была бы доступна при двух отдельных машинах,
+# здесь больше не применима (см. CLAUDE.md).
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [[services.http_checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "15s"
+    method = "get"
+    path = "/_stcore/health"

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+.env.example
+*.session
+*.session-journal
+activity.db
+activity.db-shm
+activity.db-wal
+activity.db.bak-*
+README.md
+CLAUDE.md
+TASK-*.md
+.git
