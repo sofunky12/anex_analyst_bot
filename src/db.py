@@ -69,6 +69,25 @@ def init_db(db_path: Path = DB_PATH) -> None:
             PRIMARY KEY (chat_id, message_id)
         )
     """)
+    # AAB-17: живой трекинг реакций через message_reaction (Bot API) даёт
+    # изменение только ОДНОГО автора за раз (старый набор → новый набор), не
+    # текущий общий счётчик сообщения — в отличие от message_reaction_count
+    # (уже агрегировано) и от history.py (Telethon видит готовый снимок).
+    # Поэтому здесь копится состояние по каждому автору отдельно (actor_id —
+    # user_id или id анонимного actor_chat, пространства не пересекаются:
+    # user_id всегда положительный, chat_id — всегда отрицательный), а
+    # reactions.reaction_count пересчитывается как сумма по всем авторам при
+    # каждом апдейте. Не история — текущий живой снимок, старые записи не
+    # накапливаются, только upsert/delete по актуальному состоянию.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS message_reactions_by_actor (
+            chat_id        INTEGER,
+            message_id     INTEGER,
+            actor_id       INTEGER,
+            reaction_count INTEGER NOT NULL,
+            PRIMARY KEY (chat_id, message_id, actor_id)
+        )
+    """)
     # AAB-12: токен доступа к дашборду — на пару (chat_id, user_id), не на
     # чат целиком (AAB-10). Каждый участник получает свою ссылку; владелец
     # может отозвать доступ конкретному человеку, не трогая остальных.
@@ -171,6 +190,37 @@ def upsert_reaction(cur, *, chat_id, message_id, count, updated_at) -> None:
             reaction_count = excluded.reaction_count,
             updated_at = excluded.updated_at
     """, (chat_id, message_id, count, updated_at))
+
+
+def set_actor_reaction_count(cur, *, chat_id, message_id, actor_id, count) -> None:
+    """Текущее число реакций одного автора (пользователя или анонимного
+    actor_chat) на сообщение — живой трекинг message_reaction (AAB-17).
+    count=0 (набор реакций этого автора стал пустым) удаляет строку, а не
+    хранит ноль — иначе таблица росла бы мусорными нулевыми строками."""
+    if count <= 0:
+        cur.execute(
+            "DELETE FROM message_reactions_by_actor WHERE chat_id = ? AND message_id = ? AND actor_id = ?",
+            (chat_id, message_id, actor_id),
+        )
+        return
+    cur.execute("""
+        INSERT INTO message_reactions_by_actor (chat_id, message_id, actor_id, reaction_count)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(chat_id, message_id, actor_id) DO UPDATE SET
+            reaction_count = excluded.reaction_count
+    """, (chat_id, message_id, actor_id, count))
+
+
+def total_actor_reactions(cur, chat_id, message_id) -> int:
+    """Сумма реакций всех авторов на сообщение — пересчитывается заново при
+    каждом message_reaction апдейте (AAB-17), не хранится отдельно нигде,
+    кроме итогового upsert в reactions.reaction_count."""
+    cur.execute(
+        "SELECT COALESCE(SUM(reaction_count), 0) FROM message_reactions_by_actor "
+        "WHERE chat_id = ? AND message_id = ?",
+        (chat_id, message_id),
+    )
+    return cur.fetchone()[0]
 
 
 def upsert_chat(cur, *, chat_id, title, updated_at) -> None:

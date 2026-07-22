@@ -28,6 +28,8 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    MessageReactionCountUpdated,
+    MessageReactionUpdated,
 )
 from aiogram.utils.formatting import Text, TextMention
 
@@ -601,6 +603,55 @@ async def collect_message(message: Message, bot: Bot) -> None:
             return
         cur = conn.cursor()
         _save_message(cur, message, bot.id)
+
+
+# ---------- Живой трекинг реакций (AAB-17) ----------
+# ВАЖНО: Bot API присылает эти апдейты только чатам, где бот — админ, и
+# только если "message_reaction"/"message_reaction_count" явно попали в
+# allowed_updates (тут это происходит автоматически — aiogram сам включает
+# в getUpdates типы, на которые зарегистрированы хендлеры). Без прав админа
+# бот тихо не получит вообще ничего — ни ошибки, ни апдейтов. См. CLAUDE.md.
+#
+# message_reaction — по одному живому пользователю/анонимному админу за раз
+# (старый набор реакций → новый), не текущий общий счётчик сообщения.
+# Поэтому состояние по каждому автору копится в message_reactions_by_actor,
+# а reactions.reaction_count пересчитывается как сумма по всем авторам при
+# каждом апдейте. message_reaction_count — уже агрегированный (анонимные
+# реакции), просто заменяет текущий total целиком.
+# Приходят только для чата, где идёт сбор (is_chat_active) — тот же гейт,
+# что и у collect_message.
+
+@router.message_reaction(F.chat.type.in_(GROUP_TYPES))
+async def on_message_reaction(event: MessageReactionUpdated) -> None:
+    actor_id = event.user.id if event.user else event.actor_chat.id
+    dt = event.date if event.date.tzinfo else event.date.replace(tzinfo=timezone.utc)
+    with db.get_conn() as conn:
+        if not db.is_chat_active(conn, event.chat.id):
+            return
+        cur = conn.cursor()
+        db.set_actor_reaction_count(
+            cur, chat_id=event.chat.id, message_id=event.message_id,
+            actor_id=actor_id, count=len(event.new_reaction),
+        )
+        total = db.total_actor_reactions(cur, event.chat.id, event.message_id)
+        db.upsert_reaction(
+            cur, chat_id=event.chat.id, message_id=event.message_id,
+            count=total, updated_at=dt.isoformat(),
+        )
+
+
+@router.message_reaction_count(F.chat.type.in_(GROUP_TYPES))
+async def on_message_reaction_count(event: MessageReactionCountUpdated) -> None:
+    dt = event.date if event.date.tzinfo else event.date.replace(tzinfo=timezone.utc)
+    with db.get_conn() as conn:
+        if not db.is_chat_active(conn, event.chat.id):
+            return
+        cur = conn.cursor()
+        total = sum(rc.total_count for rc in event.reactions)
+        db.upsert_reaction(
+            cur, chat_id=event.chat.id, message_id=event.message_id,
+            count=total, updated_at=dt.isoformat(),
+        )
 
 
 async def main() -> None:
