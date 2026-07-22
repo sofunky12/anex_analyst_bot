@@ -519,6 +519,18 @@ def top_users(conn, chat_id, limit=10, msg_type="text", since=None, until=None):
 def top_messages_by_reactions(conn, chat_id, limit=5, since=None, until=None):
     # Реакции — по всем типам сразу (фото/стикер вполне может быть самым
     # "залайканным" сообщением). text_encrypted отдаётся шифротекстом как есть.
+    #
+    # AAB-17: в базовых (не супер-) группах Bot API и Telethon НЕ делят единую
+    # нумерацию message_id — одно и то же реальное сообщение может лежать в
+    # messages под двумя разными message_id (один от живого сбора bot.py,
+    # другой от исторического /import_history). У обеих строк совпадают
+    # chat_id/timestamp/user_id — этого достаточно, чтобы опознать дубль.
+    # Обнаружено живым тестом: реакция на одно сообщение считалась дважды
+    # (по разу на каждый message_id) и попадала в топ как два разных пункта.
+    # Группировка ниже схлопывает такие пары. MAX(reaction_count), не SUM —
+    # обе копии независимо хранят ПОЛНЫЙ текущий счётчик реакций на одно и то
+    # же сообщение (один — от живого трекинга, другой — от резюнка истории),
+    # а не отдельные слагаемые; сложение задвоило бы счётчик, а не поправило.
     clauses = ["r.chat_id = ?"]
     params = [chat_id]
     if since:
@@ -530,11 +542,13 @@ def top_messages_by_reactions(conn, chat_id, limit=5, since=None, until=None):
     where = " AND ".join(clauses)
     cur = conn.cursor()
     cur.execute(f"""
-        SELECT m.message_id, m.text_encrypted, m.username, m.full_name, r.reaction_count
+        SELECT MIN(m.message_id), MIN(m.text_encrypted), MIN(m.username), MIN(m.full_name),
+               MAX(r.reaction_count) AS reaction_count
         FROM reactions r
         JOIN messages m ON m.chat_id = r.chat_id AND m.message_id = r.message_id
         WHERE {where}
-        ORDER BY r.reaction_count DESC
+        GROUP BY m.chat_id, m.timestamp, m.user_id
+        ORDER BY reaction_count DESC
         LIMIT ?
     """, params + [limit])
     return cur.fetchall()
