@@ -624,10 +624,6 @@ async def collect_message(message: Message, bot: Bot) -> None:
 @router.message_reaction(F.chat.type.in_(GROUP_TYPES))
 async def on_message_reaction(event: MessageReactionUpdated) -> None:
     actor_id = event.user.id if event.user else event.actor_chat.id
-    logging.info(
-        "message_reaction: chat_id=%s message_id=%s actor_id=%s new_reaction=%s",
-        event.chat.id, event.message_id, actor_id, event.new_reaction,
-    )
     dt = event.date if event.date.tzinfo else event.date.replace(tzinfo=timezone.utc)
     with db.get_conn() as conn:
         if not db.is_chat_active(conn, event.chat.id):
@@ -646,10 +642,6 @@ async def on_message_reaction(event: MessageReactionUpdated) -> None:
 
 @router.message_reaction_count(F.chat.type.in_(GROUP_TYPES))
 async def on_message_reaction_count(event: MessageReactionCountUpdated) -> None:
-    logging.info(
-        "message_reaction_count: chat_id=%s message_id=%s reactions=%s",
-        event.chat.id, event.message_id, event.reactions,
-    )
     dt = event.date if event.date.tzinfo else event.date.replace(tzinfo=timezone.utc)
     with db.get_conn() as conn:
         if not db.is_chat_active(conn, event.chat.id):
@@ -680,14 +672,6 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-
-    # AAB-17: временная диагностика — не видно, доходят ли message_reaction/
-    # message_reaction_count апдейты от Telegram вообще, до выяснения причины
-    # снять после подтверждения, что живой трекинг реакций работает.
-    @dp.update.outer_middleware()
-    async def _log_update_type(handler, event, data):
-        logging.info("update: event_type=%s", event.event_type)
-        return await handler(event, data)
 
     logging.info("Бот запущен, жду апдейтов (long polling)...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
