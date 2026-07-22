@@ -301,6 +301,14 @@ def revoke_dashboard_token_for_user(conn, chat_id, user_id) -> bool:
     return existed
 
 
+def active_chat_ids(conn) -> list:
+    """chat_id всех чатов с активным сбором — используется /help (AAB-16)
+    для определения роли: "админ хотя бы одного активного чата"."""
+    cur = conn.cursor()
+    cur.execute("SELECT chat_id FROM chats WHERE active = 1")
+    return [row[0] for row in cur.fetchall()]
+
+
 def chat_participant_user_ids(conn, chat_id) -> list:
     """Уникальные user_id, встречающиеся в уже собранных сообщениях этого
     чата (AAB-12) — Bot API не даёт списка участников напрямую для

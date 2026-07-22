@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery,
@@ -64,15 +64,21 @@ _background_tasks: set[asyncio.Task] = set()
 
 _DIRECT_TYPES = {"text", "photo", "sticker", "video", "voice"}
 _OTHER_MEDIA_TYPES = {"document", "audio", "video_note", "animation"}
+# AAB-16 (Часть C): allowlist реального контента участника — раньше любой
+# content_type, не попавший в _DIRECT_TYPES/_OTHER_MEDIA_TYPES, всё равно
+# сохранялся с msg_type="other". Из-за этого служебные сообщения Telegram
+# (new_chat_members помимо явно обработанного в on_new_chat_members,
+# left_chat_member, pinned_message, new_chat_title/photo, migrate_*, и т.п.)
+# попадали в messages как активность участника. Теперь всё, что не входит в
+# allowlist, в сборщик не идёт вообще (см. _save_message).
+_ALLOWED_CONTENT_TYPES = _DIRECT_TYPES | _OTHER_MEDIA_TYPES
 
 
 def _msg_type(message: Message) -> str:
     content_type = message.content_type
     if content_type in _DIRECT_TYPES:
         return content_type
-    if content_type in _OTHER_MEDIA_TYPES:
-        return "other_media"
-    return "other"
+    return "other_media"  # вызывается только для content_type из _ALLOWED_CONTENT_TYPES
 
 
 def _message_text(message: Message) -> str:
@@ -84,10 +90,14 @@ def _sender_fields(user):
     return user.username, full_name
 
 
-def _save_message(cur, message: Message) -> None:
+def _save_message(cur, message: Message, bot_id: int) -> None:
     user = message.from_user
     if not user:
         return  # анонимные админы / служебные сообщения без автора пропускаем
+    if user.id == bot_id:
+        return  # AAB-16: собственные исходящие сообщения бота — не активность участника
+    if message.content_type not in _ALLOWED_CONTENT_TYPES:
+        return  # AAB-16: служебное сообщение Telegram (пин/смена названия/выход и т.п.)
 
     dt = message.date
     if dt.tzinfo is None:
@@ -188,10 +198,12 @@ async def cmd_activate(message: Message, bot: Bot) -> None:
             + dashboard_for_others
         )
     else:
+        # AAB-16 (Часть B): раньше здесь была развёрнутая инструкция —
+        # сокращено до нейтрального минимума, единственный доступный канал в
+        # этом случае (личка недоступна, пока пользователь первым не напишет боту).
         await message.reply(
             "📊 Запущен сбор статистики чата.\n\n"
-            "⚠️ Не получилось отправить ссылку на дашборд в личку — сначала "
-            "напиши мне (боту) любое сообщение в личных сообщениях, затем повтори:\n/activate\n\n"
+            "⚠️ Не смог отправить ссылку в личку — напиши мне первым и повтори:\n/activate\n\n"
             + dashboard_for_others
         )
 
@@ -232,6 +244,65 @@ async def cmd_status(message: Message) -> None:
     with db.get_conn() as conn:
         active = db.is_chat_active(conn, message.chat.id)
     await message.reply("✅ Сбор активности сейчас идёт." if active else "⏸ Сбор активности сейчас не идёт.")
+
+
+# ---------- /help — список команд по роли (AAB-16, Часть A) ----------
+
+_HELP_BY_ROLE = {
+    "owner": (
+        "Доступные команды:\n\n"
+        "В группе:\n"
+        "/activate — включить сбор статистики\n"
+        "/deactivate — выключить сбор\n"
+        "/status — идёт ли сбор\n\n"
+        "В личке с ботом:\n"
+        "/dashboard — своя ссылка на дашборд чата, где ты участвуешь\n"
+        "/chats — список всех чатов в базе\n"
+        "/import_history <chat_id> — догрузить историю чата\n"
+        "/access_token <chat_id> [user_id] — выдать доступ к дашборду\n"
+        "/revoke_token <chat_id> [user_id] — отозвать доступ к дашборду"
+    ),
+    "admin": (
+        "Доступные команды:\n\n"
+        "В группе, где ты админ:\n"
+        "/activate — включить сбор статистики\n"
+        "/deactivate — выключить сбор\n"
+        "/status — идёт ли сбор\n\n"
+        "В личке с ботом:\n"
+        "/dashboard — своя ссылка на дашборд чата, где ты участвуешь"
+    ),
+    "user": (
+        "Доступные команды:\n\n"
+        "В группе (если сбор включён):\n"
+        "/status — идёт ли сбор\n\n"
+        "В личке с ботом:\n"
+        "/dashboard — своя ссылка на дашборд чата, где ты участвуешь"
+    ),
+}
+
+
+async def _user_role(bot: Bot, user_id: int) -> str:
+    # Владелец — по user_id, безопасный дефолт для всех остальных ниже.
+    if user_id == OWNER_USER_ID:
+        return "owner"
+    # Админ хотя бы одного чата с активным сбором — первое совпадение
+    # достаточно, дальше чаты не проверяем.
+    with db.get_conn() as conn:
+        chat_ids = db.active_chat_ids(conn)
+    for chat_id in chat_ids:
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+        except TelegramBadRequest:
+            continue  # пользователь не состоит в этом чате — не ошибка, просто пропускаем
+        if member.status in ("administrator", "creator"):
+            return "admin"
+    return "user"
+
+
+@router.message(Command("help"), F.chat.type == "private")
+async def cmd_help(message: Message, bot: Bot) -> None:
+    role = await _user_role(bot, message.from_user.id)
+    await message.answer(_HELP_BY_ROLE[role])
 
 
 # ---------- Команды в личке (любой пользователь) ----------
@@ -400,7 +471,14 @@ async def cmd_access_token(message: Message, bot: Bot, command: CommandObject) -
 
     with db.get_conn() as conn:
         title = db.chat_title(conn, chat_id)
-        target_user_ids = [user_id] if user_id is not None else db.chat_participant_user_ids(conn, chat_id)
+        if user_id is not None:
+            target_user_ids = [user_id]
+        else:
+            # AAB-16: защита от уже существующих в БД строк с user_id бота
+            # (собирались до фикса сборщика) — бот сам себе не участник.
+            target_user_ids = [
+                uid for uid in db.chat_participant_user_ids(conn, chat_id) if uid != bot.id
+            ]
 
     if not target_user_ids:
         await message.answer("Не нашёл ни одного участника этого чата в собранных данных.")
@@ -517,12 +595,12 @@ async def on_new_chat_members(message: Message, bot: Bot) -> None:
 
 
 @router.message(F.chat.type.in_(GROUP_TYPES))
-async def collect_message(message: Message) -> None:
+async def collect_message(message: Message, bot: Bot) -> None:
     with db.get_conn() as conn:
         if not db.is_chat_active(conn, message.chat.id):
             return
         cur = conn.cursor()
-        _save_message(cur, message)
+        _save_message(cur, message, bot.id)
 
 
 async def main() -> None:
