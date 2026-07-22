@@ -533,9 +533,8 @@ async def cmd_import_history(message: Message, command: CommandObject) -> None:
                 f"📨 Новых сообщений: {result['total']}\n"
                 f"   └ с реакциями: {result['with_reactions']}\n"
                 f"\n"
-                f"❤️ Реакции за последние {history.REACTION_RESYNC_LOOKBACK_DAYS} дн.: "
-                f"{result['reactions_resynced']} сообщений с реакциями сейчас в базе\n"
-                f"   └ это снимок на текущий момент, а не «сколько изменилось» с прошлого запуска"
+                f"❤️ Дальнейшие изменения реакций (в том числе на этих сообщениях) "
+                f"отслеживаются вживую, если бот — админ чата."
             )
         except history.NeedsReauthError as exc:
             await message.answer(f"❌ {exc}")
