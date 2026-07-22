@@ -121,6 +121,7 @@ def _save_message(cur, message: Message, bot_id: int) -> None:
         dt=dt.isoformat(),
         weekday=dt.weekday(),
         hour=dt.hour,
+        source="bot",
     )
 
 
@@ -611,6 +612,13 @@ async def collect_message(message: Message, bot: Bot) -> None:
 # в getUpdates типы, на которые зарегистрированы хендлеры). Без прав админа
 # бот тихо не получит вообще ничего — ни ошибки, ни апдейтов. См. CLAUDE.md.
 #
+# Событие несёт message_id в нумерации Bot API — резолвим его в канонический
+# msg_key через find_message_identity(source="bot"), т.к. в базовых группах
+# у Bot API и Telethon разные нумерации message_id (см. CLAUDE.md). Если
+# сообщение не найдено под этим message_id с source="bot" — значит бот его
+# не собирал (например, реакция на сообщение до /activate) — обновлять
+# нечего, тихо выходим.
+#
 # message_reaction — по одному живому пользователю/анонимному админу за раз
 # (старый набор реакций → новый), не текущий общий счётчик сообщения.
 # Поэтому состояние по каждому автору копится в message_reactions_by_actor,
@@ -627,14 +635,16 @@ async def on_message_reaction(event: MessageReactionUpdated) -> None:
     with db.get_conn() as conn:
         if not db.is_chat_active(conn, event.chat.id):
             return
+        identity = db.find_message_identity(conn, event.chat.id, event.message_id, source="bot")
+        if identity is None:
+            return
+        user_id, timestamp = identity
+        key = db.msg_key(event.chat.id, user_id, timestamp)
         cur = conn.cursor()
-        db.set_actor_reaction_count(
-            cur, chat_id=event.chat.id, message_id=event.message_id,
-            actor_id=actor_id, count=len(event.new_reaction),
-        )
-        total = db.total_actor_reactions(cur, event.chat.id, event.message_id)
+        db.set_actor_reaction_count(cur, key=key, actor_id=actor_id, count=len(event.new_reaction))
+        total = db.total_actor_reactions(cur, key)
         db.upsert_reaction(
-            cur, chat_id=event.chat.id, message_id=event.message_id,
+            cur, chat_id=event.chat.id, user_id=user_id, timestamp=timestamp,
             count=total, updated_at=dt.isoformat(),
         )
 
@@ -645,10 +655,14 @@ async def on_message_reaction_count(event: MessageReactionCountUpdated) -> None:
     with db.get_conn() as conn:
         if not db.is_chat_active(conn, event.chat.id):
             return
+        identity = db.find_message_identity(conn, event.chat.id, event.message_id, source="bot")
+        if identity is None:
+            return
+        user_id, timestamp = identity
         cur = conn.cursor()
         total = sum(rc.total_count for rc in event.reactions)
         db.upsert_reaction(
-            cur, chat_id=event.chat.id, message_id=event.message_id,
+            cur, chat_id=event.chat.id, user_id=user_id, timestamp=timestamp,
             count=total, updated_at=dt.isoformat(),
         )
 

@@ -95,12 +95,13 @@ def _save_message(cur, chat_id, message, sender) -> None:
         dt=dt.isoformat(),
         weekday=dt.weekday(),
         hour=dt.hour,
+        source="history",
     )
 
     if message.reactions and message.reactions.results:
         count = sum(r.count for r in message.reactions.results)
-        db.upsert_reaction(cur, chat_id=chat_id, message_id=message.id,
-                            count=count, updated_at=dt.isoformat())
+        db.upsert_reaction(cur, chat_id=chat_id, user_id=message.sender_id,
+                            timestamp=dt.isoformat(), count=count, updated_at=dt.isoformat())
 
 
 async def import_history(chat_id, progress_callback=None) -> dict:

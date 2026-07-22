@@ -45,8 +45,19 @@ def init_db(db_path: Path = DB_PATH) -> None:
             deactivated_at TEXT
         )
     """)
+    # AAB-17 (второй раунд): PRIMARY KEY — msg_key = "chat_id:user_id:timestamp",
+    # не message_id. В базовых (не супер-) группах Bot API и Telethon не
+    # делят единую нумерацию message_id — одно и то же сообщение получает
+    # разные message_id в bot.py и history.py, поэтому PK по message_id не
+    # дедуплицировал (см. CLAUDE.md, «Платформенные ограничения»). timestamp
+    # совпадает в обеих системах всегда — msg_key даёт настоящий сквозной
+    # идентификатор без группировок задним числом в запросах. message_id
+    # остаётся информационной колонкой + source ('bot'/'history') — нужны,
+    # чтобы резолвить входящий message_reaction-апдейт (несёт только
+    # Bot-API-шный message_id) обратно в msg_key, см. find_message_identity.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS messages (
+            msg_key        TEXT PRIMARY KEY,
             message_id     INTEGER,
             chat_id        INTEGER,
             user_id        INTEGER,
@@ -57,16 +68,15 @@ def init_db(db_path: Path = DB_PATH) -> None:
             timestamp      TEXT,    -- ISO 8601, UTC
             weekday        INTEGER, -- 0 = понедельник ... 6 = воскресенье
             hour           INTEGER,
-            PRIMARY KEY (message_id, chat_id)
+            source         TEXT NOT NULL DEFAULT 'bot'
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reactions (
+            msg_key        TEXT PRIMARY KEY,
             chat_id        INTEGER,
-            message_id     INTEGER,
             reaction_count INTEGER,
-            updated_at     TEXT,
-            PRIMARY KEY (chat_id, message_id)
+            updated_at     TEXT
         )
     """)
     # AAB-17: живой трекинг реакций через message_reaction (Bot API) даёт
@@ -81,11 +91,10 @@ def init_db(db_path: Path = DB_PATH) -> None:
     # накапливаются, только upsert/delete по актуальному состоянию.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS message_reactions_by_actor (
-            chat_id        INTEGER,
-            message_id     INTEGER,
+            msg_key        TEXT,
             actor_id       INTEGER,
             reaction_count INTEGER NOT NULL,
-            PRIMARY KEY (chat_id, message_id, actor_id)
+            PRIMARY KEY (msg_key, actor_id)
         )
     """)
     # AAB-12: токен доступа к дашборду — на пару (chat_id, user_id), не на
@@ -106,6 +115,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(chat_id, user_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(chat_id, timestamp)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_msgid ON messages(chat_id, message_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_tokens_chat ON dashboard_tokens(chat_id)")
     conn.commit()
     _run_migrations(conn)
@@ -146,9 +156,108 @@ def _migration_002_chat_access_token(conn) -> None:
         cur.execute("ALTER TABLE chats ADD COLUMN chat_access_token TEXT")
 
 
+def _migration_003_canonical_msg_key(conn) -> None:
+    """AAB-17 (второй раунд): переход messages/reactions/message_reactions_by_actor
+    на PK msg_key = "chat_id:user_id:timestamp" вместо message_id — см.
+    комментарий у CREATE TABLE messages выше и CLAUDE.md («Платформенные
+    ограничения», «Решения»). SQLite не даёт ALTER TABLE менять PRIMARY KEY —
+    пересоздаём таблицы и переносим данные. INSERT OR IGNORE с ORDER BY
+    message_id — если в старых данных ещё остались дубли одного сообщения
+    под разными message_id, оставляем ту запись, где он меньше (эмпирически
+    подтверждено — это всегда живая копия от bot.py, не historical-импорт)."""
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(messages)")
+    if any(row[1] == "msg_key" for row in cur.fetchall()):
+        return  # уже новая схема — свежая база или миграция уже применялась
+
+    cur.execute("""
+        CREATE TABLE messages_new (
+            msg_key        TEXT PRIMARY KEY,
+            message_id     INTEGER,
+            chat_id        INTEGER,
+            user_id        INTEGER,
+            username       TEXT,
+            full_name      TEXT,
+            text_encrypted TEXT,
+            msg_type       TEXT,
+            timestamp      TEXT,
+            weekday        INTEGER,
+            hour           INTEGER,
+            source         TEXT NOT NULL DEFAULT 'bot'
+        )
+    """)
+    cur.execute("""
+        INSERT OR IGNORE INTO messages_new
+            (msg_key, message_id, chat_id, user_id, username, full_name,
+             text_encrypted, msg_type, timestamp, weekday, hour, source)
+        SELECT chat_id || ':' || user_id || ':' || timestamp,
+               message_id, chat_id, user_id, username, full_name,
+               text_encrypted, msg_type, timestamp, weekday, hour, 'bot'
+        FROM messages
+        ORDER BY message_id
+    """)
+
+    cur.execute("""
+        CREATE TABLE reactions_new (
+            msg_key        TEXT PRIMARY KEY,
+            chat_id        INTEGER,
+            reaction_count INTEGER,
+            updated_at     TEXT
+        )
+    """)
+    # GROUP BY здесь — разовая миграция уже накопленных дублей (см. AAB-17,
+    # найдено 122+ на реальных данных), не постоянный механизм: после
+    # переноса reactions.msg_key уникален по построению, новые запросы к
+    # reactions больше не группируют.
+    cur.execute("""
+        INSERT INTO reactions_new (msg_key, chat_id, reaction_count, updated_at)
+        SELECT m.chat_id || ':' || m.user_id || ':' || m.timestamp,
+               m.chat_id, MAX(r.reaction_count), MAX(r.updated_at)
+        FROM reactions r
+        JOIN messages m ON m.chat_id = r.chat_id AND m.message_id = r.message_id
+        GROUP BY m.chat_id, m.user_id, m.timestamp
+    """)
+
+    cur.execute("""
+        CREATE TABLE message_reactions_by_actor_new (
+            msg_key        TEXT,
+            actor_id       INTEGER,
+            reaction_count INTEGER NOT NULL,
+            PRIMARY KEY (msg_key, actor_id)
+        )
+    """)
+    # message_reactions_by_actor могла: (а) ещё не существовать (совсем старая
+    # база, до появления этой таблицы в AAB-17) — тогда CREATE TABLE IF NOT
+    # EXISTS выше в init_db() уже создал её сразу в НОВОЙ форме, переносить
+    # нечего; (б) существовать в старой форме (chat_id/message_id/actor_id) —
+    # тогда переносим через join; проверяем по факту наличия колонки chat_id.
+    cur.execute("PRAGMA table_info(message_reactions_by_actor)")
+    actor_columns = {row[1] for row in cur.fetchall()}
+    if "chat_id" in actor_columns:
+        cur.execute("""
+            INSERT OR IGNORE INTO message_reactions_by_actor_new (msg_key, actor_id, reaction_count)
+            SELECT m.chat_id || ':' || m.user_id || ':' || m.timestamp, a.actor_id, a.reaction_count
+            FROM message_reactions_by_actor a
+            JOIN messages m ON m.chat_id = a.chat_id AND m.message_id = a.message_id
+        """)
+
+    cur.execute("DROP TABLE messages")
+    cur.execute("ALTER TABLE messages_new RENAME TO messages")
+    cur.execute("DROP TABLE reactions")
+    cur.execute("ALTER TABLE reactions_new RENAME TO reactions")
+    cur.execute("DROP TABLE IF EXISTS message_reactions_by_actor")
+    cur.execute("ALTER TABLE message_reactions_by_actor_new RENAME TO message_reactions_by_actor")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(chat_id, user_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(chat_id, timestamp)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_msgid ON messages(chat_id, message_id)")
+
+
 MIGRATIONS = [
     _migration_001_chat_activation,
     _migration_002_chat_access_token,
+    _migration_003_canonical_msg_key,
 ]
 
 
@@ -173,52 +282,80 @@ def get_conn(db_path: Path = DB_PATH):
 
 # ---------- Запись данных ----------
 
+def msg_key(chat_id, user_id, timestamp) -> str:
+    """Сквозной идентификатор сообщения (AAB-17) — chat_id/user_id/timestamp
+    совпадают для одного и того же реального сообщения что в Bot API, что в
+    Telethon (в отличие от message_id, см. CLAUDE.md, «Платформенные
+    ограничения»). Используется как PK messages/reactions/
+    message_reactions_by_actor вместо message_id — дедупликация становится
+    свойством схемы, а не запроса."""
+    return f"{chat_id}:{user_id}:{timestamp}"
+
+
 def upsert_message(cur, *, message_id, chat_id, user_id, username, full_name,
-                    text_encrypted, msg_type, dt, weekday, hour) -> None:
+                    text_encrypted, msg_type, dt, weekday, hour, source) -> None:
     cur.execute("""
         INSERT OR IGNORE INTO messages
-        (message_id, chat_id, user_id, username, full_name, text_encrypted, msg_type, timestamp, weekday, hour)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (message_id, chat_id, user_id, username, full_name, text_encrypted, msg_type, dt, weekday, hour))
+        (msg_key, message_id, chat_id, user_id, username, full_name, text_encrypted, msg_type, timestamp, weekday, hour, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (msg_key(chat_id, user_id, dt), message_id, chat_id, user_id, username, full_name,
+          text_encrypted, msg_type, dt, weekday, hour, source))
 
 
-def upsert_reaction(cur, *, chat_id, message_id, count, updated_at) -> None:
+def find_message_identity(conn, chat_id, message_id, source):
+    """Резолвит message_id из конкретного источника ('bot' или 'history') в
+    (user_id, timestamp) этого сообщения — нужно только живому трекингу
+    реакций (AAB-17): входящий message_reaction-апдейт несёт message_id в
+    нумерации Bot API, а канонический ключ сообщения — msg_key
+    (chat_id/user_id/timestamp), не message_id. Фильтр по source обязателен:
+    у Bot API и Telethon разные, несвязанные нумерации message_id (см.
+    CLAUDE.md) — без source один и тот же message_id мог бы случайно
+    совпасть у двух разных реальных сообщений из разных источников."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, timestamp FROM messages WHERE chat_id = ? AND message_id = ? AND source = ?",
+        (chat_id, message_id, source),
+    )
+    row = cur.fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def upsert_reaction(cur, *, chat_id, user_id, timestamp, count, updated_at) -> None:
     cur.execute("""
-        INSERT INTO reactions (chat_id, message_id, reaction_count, updated_at)
+        INSERT INTO reactions (msg_key, chat_id, reaction_count, updated_at)
         VALUES (?, ?, ?, ?)
-        ON CONFLICT(chat_id, message_id) DO UPDATE SET
+        ON CONFLICT(msg_key) DO UPDATE SET
             reaction_count = excluded.reaction_count,
             updated_at = excluded.updated_at
-    """, (chat_id, message_id, count, updated_at))
+    """, (msg_key(chat_id, user_id, timestamp), chat_id, count, updated_at))
 
 
-def set_actor_reaction_count(cur, *, chat_id, message_id, actor_id, count) -> None:
+def set_actor_reaction_count(cur, *, key, actor_id, count) -> None:
     """Текущее число реакций одного автора (пользователя или анонимного
     actor_chat) на сообщение — живой трекинг message_reaction (AAB-17).
     count=0 (набор реакций этого автора стал пустым) удаляет строку, а не
     хранит ноль — иначе таблица росла бы мусорными нулевыми строками."""
     if count <= 0:
         cur.execute(
-            "DELETE FROM message_reactions_by_actor WHERE chat_id = ? AND message_id = ? AND actor_id = ?",
-            (chat_id, message_id, actor_id),
+            "DELETE FROM message_reactions_by_actor WHERE msg_key = ? AND actor_id = ?",
+            (key, actor_id),
         )
         return
     cur.execute("""
-        INSERT INTO message_reactions_by_actor (chat_id, message_id, actor_id, reaction_count)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(chat_id, message_id, actor_id) DO UPDATE SET
+        INSERT INTO message_reactions_by_actor (msg_key, actor_id, reaction_count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(msg_key, actor_id) DO UPDATE SET
             reaction_count = excluded.reaction_count
-    """, (chat_id, message_id, actor_id, count))
+    """, (key, actor_id, count))
 
 
-def total_actor_reactions(cur, chat_id, message_id) -> int:
+def total_actor_reactions(cur, key) -> int:
     """Сумма реакций всех авторов на сообщение — пересчитывается заново при
     каждом message_reaction апдейте (AAB-17), не хранится отдельно нигде,
     кроме итогового upsert в reactions.reaction_count."""
     cur.execute(
-        "SELECT COALESCE(SUM(reaction_count), 0) FROM message_reactions_by_actor "
-        "WHERE chat_id = ? AND message_id = ?",
-        (chat_id, message_id),
+        "SELECT COALESCE(SUM(reaction_count), 0) FROM message_reactions_by_actor WHERE msg_key = ?",
+        (key,),
     )
     return cur.fetchone()[0]
 
@@ -529,18 +666,10 @@ def top_messages_by_reactions(conn, chat_id, limit=5, since=None, until=None):
     # Реакции — по всем типам сразу (фото/стикер вполне может быть самым
     # "залайканным" сообщением). text_encrypted отдаётся шифротекстом как есть.
     #
-    # AAB-17: в базовых (не супер-) группах Bot API и Telethon исторически не
-    # делили единую нумерацию message_id — одно и то же сообщение могло лежать
-    # в messages под двумя message_id (живой сбор bot.py и /import_history).
-    # Корневой фикс — history.py теперь строго ограничивает довозку истории по
-    # timestamp и не заходит в диапазон, уже покрытый живым сбором (см.
-    # CLAUDE.md, «Решения»/«Платформенные ограничения»), так что новых таких
-    # дублей появиться не должно. Группировка ниже — страховка для СТАРЫХ
-    # данных, собранных до этого фикса (найдено 122+ задвоенных сообщений):
-    # у обеих копий совпадают chat_id/timestamp/user_id, этим и опознаются.
-    # MAX(reaction_count), не SUM — обе копии независимо хранят ПОЛНЫЙ текущий
-    # счётчик реакций на одно и то же сообщение, а не отдельные слагаемые;
-    # сложение задвоило бы счётчик, а не поправило.
+    # AAB-17: reactions/messages соединяются по msg_key (сквозной ключ
+    # chat_id/user_id/timestamp, см. msg_key()) — одно сообщение из двух
+    # источников (bot.py/history.py) не может дать два разных msg_key,
+    # дедупликация — свойство схемы, группировка здесь не нужна в принципе.
     clauses = ["r.chat_id = ?"]
     params = [chat_id]
     if since:
@@ -552,13 +681,11 @@ def top_messages_by_reactions(conn, chat_id, limit=5, since=None, until=None):
     where = " AND ".join(clauses)
     cur = conn.cursor()
     cur.execute(f"""
-        SELECT MIN(m.message_id), MIN(m.text_encrypted), MIN(m.username), MIN(m.full_name),
-               MAX(r.reaction_count) AS reaction_count
+        SELECT m.message_id, m.text_encrypted, m.username, m.full_name, r.reaction_count
         FROM reactions r
-        JOIN messages m ON m.chat_id = r.chat_id AND m.message_id = r.message_id
+        JOIN messages m ON m.msg_key = r.msg_key
         WHERE {where}
-        GROUP BY m.chat_id, m.timestamp, m.user_id
-        ORDER BY reaction_count DESC
+        ORDER BY r.reaction_count DESC
         LIMIT ?
     """, params + [limit])
     return cur.fetchall()
